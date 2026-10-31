@@ -7,7 +7,6 @@ if (!API_KEY) {
   throw new Error("Missing TWELVE_DATA_API_KEY");
 }
 
-// Initial major Forex pairs
 export const FOREX_PAIRS = [
   "EUR/USD",
   "GBP/USD",
@@ -18,12 +17,32 @@ export const FOREX_PAIRS = [
   "USD/CHF"
 ];
 
-// Fetch historical candles
+// Free-plan request spacing
+const REQUEST_DELAY_MS = 8500;
+
+let lastRequestTime = 0;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForRequestSlot() {
+  const elapsed = Date.now() - lastRequestTime;
+
+  if (elapsed < REQUEST_DELAY_MS) {
+    await sleep(REQUEST_DELAY_MS - elapsed);
+  }
+
+  lastRequestTime = Date.now();
+}
+
 export async function getCandles(
   symbol,
   interval,
   outputsize = 100
 ) {
+  await waitForRequestSlot();
+
   const url = new URL(`${BASE_URL}/time_series`);
 
   url.searchParams.set("symbol", symbol);
@@ -35,7 +54,9 @@ export async function getCandles(
   const response = await fetch(url);
 
   if (!response.ok) {
-    throw new Error(`Twelve Data HTTP error: ${response.status}`);
+    throw new Error(
+      `Twelve Data HTTP error: ${response.status}`
+    );
   }
 
   const data = await response.json();
@@ -46,7 +67,6 @@ export async function getCandles(
     );
   }
 
-  // Convert prices to numbers and arrange oldest first
   return data.values
     .map(candle => ({
       datetime: candle.datetime,
@@ -58,14 +78,27 @@ export async function getCandles(
     .reverse();
 }
 
-// Fetch all three analysis timeframes
+// Fetch timeframes sequentially
 export async function getMarketSnapshot(symbol) {
-  const [daily, fourHour, fifteenMinute] =
-    await Promise.all([
-      getCandles(symbol, "1day", 100),
-      getCandles(symbol, "4h", 100),
-      getCandles(symbol, "15min", 100)
-    ]);
+  console.log(`Downloading market data for ${symbol}`);
+
+  const daily = await getCandles(
+    symbol,
+    "1day",
+    100
+  );
+
+  const fourHour = await getCandles(
+    symbol,
+    "4h",
+    100
+  );
+
+  const fifteenMinute = await getCandles(
+    symbol,
+    "15min",
+    100
+  );
 
   return {
     symbol,
