@@ -1,11 +1,8 @@
 
-const API_KEY = process.env.TWELVE_DATA_API_KEY;
+import WebSocket from "ws";
 
-const BASE_URL = "https://api.twelvedata.com";
-
-if (!API_KEY) {
-  throw new Error("Missing TWELVE_DATA_API_KEY");
-}
+const DERIV_WS_URL =
+  "wss://api.derivws.com/trading/v1/options/ws/public";
 
 export const FOREX_PAIRS = [
   "EUR/USD",
@@ -17,94 +14,198 @@ export const FOREX_PAIRS = [
   "USD/CHF"
 ];
 
-// Free-plan request spacing
-const REQUEST_DELAY_MS = 8500;
+const TIMEFRAMES = {
+  daily: 86400,
+  fourHour: 14400,
+  fifteenMinute: 900
+};
 
-let lastRequestTime = 0;
+let requestId = 1;
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function connectToDeriv() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(DERIV_WS_URL);
+
+    const timeout = setTimeout(() => {
+      ws.close();
+      reject(new Error("Deriv connection timed out"));
+    }, 15000);
+
+    ws.once("open", () => {
+      clearTimeout(timeout);
+      resolve(ws);
+    });
+
+    ws.once("error", error => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
 }
 
-async function waitForRequestSlot() {
-  const elapsed = Date.now() - lastRequestTime;
+function requestData(ws, request) {
+  return new Promise((resolve, reject) => {
+    const id = requestId++;
+    const timeout = setTimeout(() => {
+      ws.off("message", onMessage);
+      reject(new Error("Deriv request timed out"));
+    }, 20000);
 
-  if (elapsed < REQUEST_DELAY_MS) {
-    await sleep(REQUEST_DELAY_MS - elapsed);
-  }
+    function onMessage(rawMessage) {
+      let data;
 
-  lastRequestTime = Date.now();
+      try {
+        data = JSON.parse(rawMessage.toString());
+      } catch {
+        return;
+      }
+
+      if (data.req_id !== id) return;
+
+      clearTimeout(timeout);
+      ws.off("message", onMessage);
+
+      if (data.error) {
+        reject(new Error(data.error.message));
+        return;
+      }
+
+      resolve(data);
+    }
+
+    ws.on("message", onMessage);
+
+    ws.send(JSON.stringify({
+      ...request,
+      req_id: id
+    }), error => {
+      if (error) {
+        clearTimeout(timeout);
+        ws.off("message", onMessage);
+        reject(error);
+      }
+    });
+  });
 }
 
-export async function getCandles(
-  symbol,
-  interval,
-  outputsize = 100
-) {
-  await waitForRequestSlot();
+function normalizePair(value) {
+  return String(value || "")
+    .replace(/[^A-Z]/gi, "")
+    .toUpperCase();
+}
 
-  const url = new URL(`${BASE_URL}/time_series`);
+async function getDerivSymbol(ws, pair) {
+  const response = await requestData(ws, {
+    active_symbols: "brief"
+  });
 
-  url.searchParams.set("symbol", symbol);
-  url.searchParams.set("interval", interval);
-  url.searchParams.set("outputsize", outputsize);
-  url.searchParams.set("timezone", "UTC");
-  url.searchParams.set("apikey", API_KEY);
+  const symbols = response.active_symbols || [];
+  const wantedPair = normalizePair(pair);
 
-  const response = await fetch(url);
+  const match = symbols.find(item => {
+    const code = normalizePair(item.underlying_symbol);
+    const name = normalizePair(item.underlying_symbol_name);
 
-  if (!response.ok) {
+    return (
+      code === `FRX${wantedPair}` ||
+      code === wantedPair ||
+      name === wantedPair
+    );
+  });
+
+  if (!match) {
     throw new Error(
-      `Twelve Data HTTP error: ${response.status}`
+      `Deriv does not currently list ${pair} as an active symbol`
     );
   }
 
-  const data = await response.json();
+  return match.underlying_symbol;
+}
 
-  if (data.status === "error" || !data.values) {
+async function getCandles(ws, symbol, granularity) {
+  const response = await requestData(ws, {
+    ticks_history: symbol,
+    count: 101,
+    end: "latest",
+    style: "candles",
+    granularity
+  });
+
+  if (!Array.isArray(response.candles)) {
     throw new Error(
-      data.message || "Unable to retrieve market candles"
+      `No candle data returned for ${symbol}`
     );
   }
 
-  return data.values
+  const candles = response.candles
     .map(candle => ({
-      datetime: candle.datetime,
+      epoch: Number(candle.epoch),
+      datetime: new Date(
+        Number(candle.epoch) * 1000
+      ).toISOString(),
       open: Number(candle.open),
       high: Number(candle.high),
       low: Number(candle.low),
       close: Number(candle.close)
     }))
-    .reverse();
+    .filter(candle =>
+      Number.isFinite(candle.epoch) &&
+      Number.isFinite(candle.open) &&
+      Number.isFinite(candle.high) &&
+      Number.isFinite(candle.low) &&
+      Number.isFinite(candle.close)
+    )
+    .sort((a, b) => a.epoch - b.epoch);
+
+  // Exclude the newest candle because it may still be forming.
+  candles.pop();
+
+  if (candles.length < 30) {
+    throw new Error(
+      `Not enough completed candles for ${symbol}`
+    );
+  }
+
+  return candles;
 }
 
-// Fetch timeframes sequentially
-export async function getMarketSnapshot(symbol) {
-  console.log(`Downloading market data for ${symbol}`);
+export async function getMarketSnapshot(pair) {
+  console.log(`Downloading Deriv data for ${pair}`);
 
-  const daily = await getCandles(
-    symbol,
-    "1day",
-    100
-  );
+  const ws = await connectToDeriv();
 
-  const fourHour = await getCandles(
-    symbol,
-    "4h",
-    100
-  );
+  try {
+    const symbol = await getDerivSymbol(ws, pair);
 
-  const fifteenMinute = await getCandles(
-    symbol,
-    "15min",
-    100
-  );
+    console.log(`${pair} maps to Deriv symbol ${symbol}`);
 
-  return {
-    symbol,
-    daily,
-    fourHour,
-    fifteenMinute,
-    updatedAt: new Date().toISOString()
-  };
+    const daily = await getCandles(
+      ws,
+      symbol,
+      TIMEFRAMES.daily
+    );
+
+    const fourHour = await getCandles(
+      ws,
+      symbol,
+      TIMEFRAMES.fourHour
+    );
+
+    const fifteenMinute = await getCandles(
+      ws,
+      symbol,
+      TIMEFRAMES.fifteenMinute
+    );
+
+    return {
+      symbol: pair,
+      derivSymbol: symbol,
+      daily,
+      fourHour,
+      fifteenMinute,
+      updatedAt: new Date().toISOString()
+    };
+  } finally {
+    ws.close();
+  }
 }
