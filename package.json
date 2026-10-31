@@ -1,0 +1,14 @@
+
+{
+  "name": "fx-signal-bot",
+  "version": "1.0.0",
+  "description": "Multi-strategy Forex Telegram Signal Bot",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
